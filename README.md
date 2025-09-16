@@ -7,4 +7,4 @@ I believe this notebook would be helpful to you guys as well as me for referring
 
 Thanks! Feel free to contribute
 
-Start here!
+[Start here!](tutorial.ipynb)
