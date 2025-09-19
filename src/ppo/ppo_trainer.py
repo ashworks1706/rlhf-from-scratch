@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from typing import Tuple
 from transformers import Trainer
-import core_utils
+from core_utils import masked_mean, masked_var, masked_whiten
 
 
 class PPOTrainer(Trainer):
@@ -19,9 +20,9 @@ class PPOTrainer(Trainer):
     ):
         self.args = args
         self.actor_model = ppo_engine.actor_model
-        self.ref_model = ppo_engine.ref_model
+        self.critic_model = ppo_engine.critic_model
 
-        self.model = PPOModel(self.actor_model, self.ref_model)
+        self.model = PPOModel(self.actor_model, self.critic_model)
 
     def get_params(self, model, lr, weight_decay, eps=1e-8):
         params = [
@@ -36,13 +37,60 @@ class PPOTrainer(Trainer):
 
     def create_optimizer(self):
         params = self.get_params(self.actor_model, self.args.actor_lr, self.args.actor_weight_decay)
-        params.extend(self.get_params(self.ref_model, self.args.ref_lr, self.args.ref_weight_decay))
+        params.extend(self.get_params(self.critic_model, self.args.critic_lr, self.args.critic_weight_decay))
 
         optimizer = torch.optim.Optimizers.AdamW(params, betas = (0.9, 0.95))
         return optimizer
+    
+    def create_scheduler(self, optimizer, max_update_steps):
+        params = self.get_params(self.actor_model, self.args.actor_lr, self.args.actor_weight_decay)
+        params.extend(self.get_params(self.crttic_model, self.args.critic_lr, self.args.critic_weight_decay))
 
-    def get_last_reward_score(self):
-        raise NotImplementedError
+    def get_last_reward_score(self, values, responses_mask):
+        """
+        Computes the critic's last-state value estimates.
+
+        Args:
+            values: torch.Tensor
+                the critic model's outputs for all tokens (baseline V(s_t))
+            responses_mask: torch.Tensor
+                binary mask marking which tokens belong to the generated response
+        """
+        batch_size = values.shape[0] 
+        reward_score = []
+        for i in range(batch_size):
+            value = values[i] 
+            end_idx = responses_mask[i].nonzero()[-1].detach().item() # last token in the sequence
+            reward_score.append(value[end_idx]) # collect value prediction at the final token
+        rewards_score = torch.stack(reward_score) # collect all last-state value estimates
+
+        return rewards_score
+    
+    def get_log_probs(self, logits, labels):
+        """
+        Computes the log-probabilities given logits, and computes the label
+        """
+        log_probs = F.log_softmax(logits, dim=-1)
+        labels = labels.unsqueeze(-1)
+        log_probs_labels = log_probs.gather(dim=-1, index=labels)
+        return log_probs_labels.squeeze(-1)
+    
+    def get_entropy(self, logits, mask):
+        """
+        Computes the entropy of the policy, which incentivizes exploration.
+
+        Args:
+            logits: torch.Tensor
+                unnormalized log-probabilities from a model
+            mask: torch.Tensor
+                mask to be applied to the computed entropy
+        """
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = self.masked_mean(-torch.sum(probs * log_probs, dim=-1), mask)
+        return entropy
+
+
 
     def compute_rewards_with_kl_penalty(self, ref_values, actor_log_probs, ref_log_probs, responses_mask):
         """
@@ -199,3 +247,29 @@ class PPOTrainer(Trainer):
         # this is essentially the inner sum for one trajectory t \in D_k where D_k is set of trajectories
         loss = 0.5 * masked_mean(torch.max(values_error, clip_values_error), eos_mask)
         return loss, values_error
+    
+    @torch.no_grad()
+    def get_model_output(self, sequences):
+        """
+        Fetches the model outputs from both the actor and the critic 
+        """
+        actor_output = self.actor_model(**sequences, return_dict=True) # of shape (B, T, V)
+        actor_logits = actor_output.logits
+
+        critic_values = self.critic_model(**sequences)[-1] # get the last scalar, of shape (B, T)
+        
+        # now, fetch reference logits for the KL divergence (from a frozen model)
+        ref_output = self.ref_model(**sequences, return_dict=True)
+
+    def get_state_dict(self, model):
+        """
+        Collects the state dict of our pretrained model. 
+        The value head is a linear projection of our pretrained model's last hidden states onto a scalar
+        which estimates the value of a state (for variance reduction, advantage computation).
+        """
+        pretrained_model_state_dict = model.pretrained_model.state_dict()
+        value_head_state_dict = model.value_head.state_dict()
+        for k, v in value_head_state_dict.items():
+            pretrained_model_state_dict[f"value_head.{k}"] = v
+        return pretrained_model_state_dict
+    
